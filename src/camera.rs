@@ -1,0 +1,175 @@
+use rand::RngExt;
+use std::io::Write;
+
+use crate::vector3::{Vec3, Point3};
+use crate::ray::Ray;
+use crate::color::{Color, write_color};
+use crate::interval::Interval;
+use crate::hittable::{Hittable, HitRecord};
+
+pub struct Camera {
+    pub aspect_ratio:      f64,
+    pub image_width:       i32,
+    pub samples_per_pixel: i32,
+    pub max_depth:         i32,
+    pub vfov:              f64,
+    pub lookfrom:          Point3,
+    pub lookat:            Point3,
+    pub vup:               Vec3,
+    pub defocus_angle:     f64,
+    pub focus_dist:        f64,
+
+    image_height:        i32,
+    pixel_samples_scale: f64,
+    center:              Point3,
+    pixel00_loc:         Point3,
+    pixel_delta_u:       Vec3,
+    pixel_delta_v:       Vec3,
+    u:                   Vec3,
+    v:                   Vec3,
+    w:                   Vec3,
+    defocus_disk_u:      Vec3,
+    defocus_disk_v:      Vec3,
+}
+
+impl Camera {
+    pub fn new() -> Self {
+        Self {
+            aspect_ratio:      1.0,
+            image_width:       100,
+            samples_per_pixel: 10,
+            max_depth:         10,
+            vfov:              90.0,
+            lookfrom:          Point3::new(0.0, 0.0, 0.0),
+            lookat:            Point3::new(0.0, 0.0, -1.0),
+            vup:               Vec3::new(0.0, 1.0, 0.0),
+            defocus_angle:     0.0,
+            focus_dist:        10.0,
+
+            image_height:        0,
+            pixel_samples_scale: 0.0,
+            center:              Point3::new(0.0, 0.0, 0.0),
+            pixel00_loc:         Point3::new(0.0, 0.0, 0.0),
+            pixel_delta_u:       Vec3::new(0.0, 0.0, 0.0),
+            pixel_delta_v:       Vec3::new(0.0, 0.0, 0.0),
+            u:                   Vec3::new(0.0, 0.0, 0.0),
+            v:                   Vec3::new(0.0, 0.0, 0.0),
+            w:                   Vec3::new(0.0, 0.0, 0.0),
+            defocus_disk_u:      Vec3::new(0.0, 0.0, 0.0),
+            defocus_disk_v:      Vec3::new(0.0, 0.0, 0.0),
+        }
+    }
+
+    pub fn render(&mut self, world: &dyn Hittable) {
+        self.initialize();
+
+        let stdout = std::io::stdout();
+        let mut out = stdout.lock();
+
+        writeln!(out, "P3\n{} {}\n255", self.image_width, self.image_height).unwrap();
+
+        for j in 0..self.image_height {
+            eprint!("\rScanlines remaining: {} ", self.image_height - j);
+
+            for i in 0..self.image_width {
+                let mut pixel_color = Color::new(0.0, 0.0, 0.0);
+
+                for _ in 0..self.samples_per_pixel {
+                    let r = self.get_ray(i, j);
+                    pixel_color += self.ray_color(&r, self.max_depth, world);
+                }
+
+                write_color(&mut out, self.pixel_samples_scale * pixel_color);
+            }
+        }
+        eprintln!("\rDone.                    ");
+    }
+
+
+    fn initialize(&mut self) {
+        self.image_height = (self.image_width as f64 / self.aspect_ratio) as i32;
+        if self.image_height < 1 { self.image_height = 1; }
+
+        self.pixel_samples_scale = 1.0 / self.samples_per_pixel as f64;
+        self.center = self.lookfrom;
+
+        let theta          = self.vfov.to_radians();  
+        let h              = (theta / 2.0).tan();
+        let viewport_height = 2.0 * h * self.focus_dist;
+        let viewport_width  = viewport_height * (self.image_width as f64 / self.image_height as f64);
+
+        self.w = (self.lookfrom - self.lookat).unit_vector();
+        self.u = self.vup.cross(self.w).unit_vector();
+        self.v = self.w.cross(self.u);
+
+        let viewport_u = viewport_width  *  self.u;
+        let viewport_v = viewport_height * -self.v;
+
+        self.pixel_delta_u = viewport_u / self.image_width  as f64;
+        self.pixel_delta_v = viewport_v / self.image_height as f64;
+
+        let viewport_upper_left = self.center
+            - self.focus_dist * self.w
+            - viewport_u / 2.0
+            - viewport_v / 2.0;
+
+        self.pixel00_loc = viewport_upper_left
+            + 0.5 * (self.pixel_delta_u + self.pixel_delta_v);
+
+        let defocus_radius = self.focus_dist
+            * (self.defocus_angle / 2.0).to_radians().tan();
+
+        self.defocus_disk_u = self.u * defocus_radius;
+        self.defocus_disk_v = self.v * defocus_radius;
+    }
+
+    fn get_ray(&self, i: i32, j: i32) -> Ray {
+        let offset       = self.sample_square();
+        let pixel_sample = self.pixel00_loc
+            + (i as f64 + offset.x()) * self.pixel_delta_u
+            + (j as f64 + offset.y()) * self.pixel_delta_v;
+
+        let ray_origin = if self.defocus_angle <= 0.0 {
+            self.center
+        } else {
+            self.defocus_disk_sample()
+        };
+
+        Ray::new(ray_origin, pixel_sample - ray_origin)
+    }
+
+    fn sample_square(&self) -> Vec3 {
+        let mut rng = rand::rng();
+        Vec3::new(rng.random::<f64>() - 0.5, rng.random::<f64>() - 0.5, 0.0)
+    }
+
+    fn defocus_disk_sample(&self) -> Point3 {
+        let p = Vec3::random_in_unit_disk();
+        self.center + (p[0] * self.defocus_disk_u) + (p[1] * self.defocus_disk_v)
+    }
+
+    fn ray_color(&self, r: &Ray, depth: i32, world: &dyn Hittable) -> Color {
+        if depth <= 0 {
+            return Color::new(0.0, 0.0, 0.0);
+        }
+
+        let mut rec = HitRecord::default();
+
+        if world.hit(r, Interval::new(0.001, f64::INFINITY), &mut rec) {
+            let mut scattered   = Ray::new(Point3::new(0.0,0.0,0.0), Vec3::new(0.0,0.0,0.0));
+            let mut attenuation = Color::new(0.0, 0.0, 0.0);
+
+            let mat = rec.mat.clone();
+            if let Some(mat) = mat { 
+                if mat.scatter(r, &rec, &mut attenuation, &mut scattered) {
+                    return attenuation * self.ray_color(&scattered, depth - 1, world);
+                }
+            }
+            return Color::new(0.0, 0.0, 0.0);
+        }
+
+        let unit_direction = r.direction().unit_vector();
+        let a = 0.5 * (unit_direction.y() + 1.0);
+        (1.0 - a) * Color::new(1.0, 1.0, 1.0) + a * Color::new(0.5, 0.7, 1.0)
+    }
+}
